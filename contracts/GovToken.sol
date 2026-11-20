@@ -9,6 +9,12 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20VotesUpg
 import "./SystemV2.sol";
 import "./interface/0.8.x/IStakeCredit.sol";
 
+// DashEVM launch permissioning (StakeHub.permissioned / launchStakeCap).
+interface IStakeHubLaunchCap {
+    function permissioned() external view returns (bool);
+    function launchStakeCap() external view returns (uint256);
+}
+
 contract GovToken is
     SystemV2,
     Initializable,
@@ -85,6 +91,14 @@ contract GovToken is
     /*----------------- internal functions -----------------*/
     function _sync(address stakeCredit, address account) internal {
         uint256 latestBNBAmount = IStakeCredit(stakeCredit).getPooledBNB(account);
+        // While DashEVM launch permissioning caps the pools, votes are capped
+        // too: block-fee rewards (distributeReward) grow a pool past the cap
+        // without a deposit, and must not buy governance weight (review
+        // R2-H1). Once governance lifts the cap or opens registration, the next
+        // sync of (pool, account) mints the rest: any StakeHub delegate,
+        // undelegate, redelegate or reward, or StakeHub.syncGovToken by anyone.
+        uint256 cap = _launchVoteCap();
+        if (cap != 0 && latestBNBAmount > cap) latestBNBAmount = cap;
         uint256 _mintedAmount = mintedMap[stakeCredit][account];
 
         if (_mintedAmount < latestBNBAmount) {
@@ -96,6 +110,12 @@ contract GovToken is
             mintedMap[stakeCredit][account] = latestBNBAmount;
             _burn(account, _needBurn);
         }
+    }
+
+    function _launchVoteCap() internal view returns (uint256) {
+        IStakeHubLaunchCap hub = IStakeHubLaunchCap(STAKE_HUB_ADDR);
+        if (!hub.permissioned()) return 0;
+        return hub.launchStakeCap();
     }
 
     function _transfer(address, address, uint256) internal pure override {

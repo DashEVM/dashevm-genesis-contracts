@@ -9,6 +9,10 @@ import "@openzeppelin/contracts-upgradeable/utils/structs/DoubleEndedQueueUpgrad
 import "./SystemV2.sol";
 import "./interface/0.8.x/IStakeHub.sol";
 
+interface IValidatorRewardsDeit {
+    function deit() external view returns (address);
+}
+
 contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC20Upgradeable {
     using CountersUpgradeable for CountersUpgradeable.Counter;
     using DoubleEndedQueueUpgradeable for DoubleEndedQueueUpgradeable.Bytes32Deque;
@@ -58,6 +62,18 @@ contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC
     // day index => totalPooledBNB
     mapping(uint256 => uint256) public totalPooledBNBRecord;
 
+    /*----------------- DashEVM / CardanoEVM: DEIT rewards -----------------*/
+    // DEIT paid by the ValidatorRewards predeploy is shared per pool share (accumulator
+    // settled on every share mint and burn). The commission part is owed to the validator
+    // directly. Shares held by the dead address (the locked bootstrap amount) do not earn,
+    // so the whole non-commission part reaches real holders.
+    address internal constant VALIDATOR_REWARDS_ADDR = 0x0000000000000000000000000000000000005061;
+    address internal constant DEIT_DEAD = 0x000000000000000000000000000000000000dEaD;
+    uint256 private constant DEIT_ACC = 1e36;
+    uint256 public accDeitPerShare;
+    mapping(address => uint256) public deitDebt;
+    mapping(address => uint256) public deitOwed;
+
     /*----------------- structs and events -----------------*/
     struct UnbondRequest {
         uint256 shares;
@@ -66,6 +82,11 @@ contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC
     }
 
     event RewardReceived(uint256 rewardToAll, uint256 commission);
+    event DeitRewardReceived(uint256 rewardToAll, uint256 commission);
+    event DeitClaimed(address indexed account, address indexed to, uint256 amount);
+
+    // @notice only the ValidatorRewards predeploy may report DEIT rewards
+    error OnlyValidatorRewards();
 
     /**
      * @notice only accept BNB from `StakeHub`
@@ -118,6 +139,15 @@ contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC
         // add to the queue
         bnbAmount = _burnAndSync(delegator, shares);
         uint256 unlockTime = block.timestamp + IStakeHub(STAKE_HUB_ADDR).unbondPeriod();
+        // claim() pays the queue in FIFO order and stops at the first locked
+        // request, so unlock times must not decrease along the queue. After the
+        // unbond period is lowered, a new request unlocks no earlier than the
+        // one ahead of it (review R3-GOV-03); the recorded time is then the time
+        // it can really be claimed.
+        if (_unbondRequestsQueue[delegator].length() != 0) {
+            uint256 lastUnlockTime = _unbondRequests[_unbondRequestsQueue[delegator].back()].unlockTime;
+            if (lastUnlockTime > unlockTime) unlockTime = lastUnlockTime;
+        }
         UnbondRequest memory request = UnbondRequest({ shares: shares, bnbAmount: bnbAmount, unlockTime: unlockTime });
         bytes32 hash = keccak256(abi.encodePacked(delegator, _useSequence(delegator)));
         // the hash should not exist in the queue
@@ -180,17 +210,24 @@ contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC
     }
 
     /**
-     * @dev Distribute the reward to the validator and all delegators. Only the `StakeHub` contract can call this function.
+     * @dev Distribute the reward to the validator and all delegators. Only the `StakeHub` contract and the
+     * ValidatorRewards predeploy can call this function.
      * @param commissionRate the commission rate of the validator
      */
     function distributeReward(
         uint64 commissionRate
-    ) external payable onlyStakeHub {
+    ) external payable {
+        // DashEVM / CardanoEVM: the ValidatorRewards predeploy also pays native fee rewards
+        // through this path (SPEC section 6, "Fee split").
+        if (msg.sender != STAKE_HUB_ADDR && msg.sender != VALIDATOR_REWARDS_ADDR) revert OnlySystemContract(STAKE_HUB_ADDR);
         uint256 bnbAmount = msg.value;
         uint256 _commission = (bnbAmount * uint256(commissionRate)) / COMMISSION_RATE_BASE;
         uint256 _reward = bnbAmount - _commission;
 
         uint256 index = block.timestamp / IStakeHub(STAKE_HUB_ADDR).BREATHE_BLOCK_INTERVAL();
+        // Review L-5 (accepted): with ValidatorRewards also calling this, the day's record is
+        // overwritten by whichever call comes last. totalPooledBNBRecord and rewardRecord feed
+        // only APY views, never balances or shares.
         totalPooledBNBRecord[index] = totalPooledBNB;
         rewardRecord[index] += _reward;
         totalPooledBNB += _reward;
@@ -356,6 +393,66 @@ contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC
         CountersUpgradeable.Counter storage sequence = _unbondSequence[delegator];
         current = sequence.current();
         sequence.increment();
+    }
+
+    /*----------------- DEIT rewards -----------------*/
+    /**
+     * @dev Called by ValidatorRewards right after it transferred `amount` DEIT here.
+     */
+    function notifyDeitReward(uint256 amount, uint64 commissionRate) external {
+        if (msg.sender != VALIDATOR_REWARDS_ADDR) revert OnlyValidatorRewards();
+        uint256 commission = (amount * uint256(commissionRate)) / COMMISSION_RATE_BASE;
+        uint256 rest = amount - commission;
+        uint256 earning = totalSupply() - balanceOf(DEIT_DEAD);
+        if (earning == 0) {
+            commission = amount;
+            rest = 0;
+        }
+        deitOwed[validator] += commission;
+        if (rest > 0) accDeitPerShare += (rest * DEIT_ACC) / earning;
+        emit DeitRewardReceived(rest, commission);
+    }
+
+    /// @notice DEIT claimable by `account` (commission plus its share of pool rewards).
+    function pendingDeit(
+        address account
+    ) external view returns (uint256) {
+        if (account == DEIT_DEAD) return 0;
+        return deitOwed[account] + (balanceOf(account) * accDeitPerShare) / DEIT_ACC - deitDebt[account];
+    }
+
+    /// @notice Claim the caller's DEIT to `to`.
+    function claimDeit(
+        address to
+    ) external nonReentrant returns (uint256 amount) {
+        _settleDeit(msg.sender);
+        amount = deitOwed[msg.sender];
+        if (amount == 0) revert ZeroAmount();
+        deitOwed[msg.sender] = 0;
+        address token = IValidatorRewardsDeit(VALIDATOR_REWARDS_ADDR).deit();
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) revert TransferFailed();
+        emit DeitClaimed(msg.sender, to, amount);
+    }
+
+    function _settleDeit(
+        address account
+    ) internal {
+        if (account == DEIT_DEAD) return;
+        uint256 accrued = (balanceOf(account) * accDeitPerShare) / DEIT_ACC;
+        deitOwed[account] += accrued - deitDebt[account];
+        deitDebt[account] = accrued;
+    }
+
+    function _beforeTokenTransfer(address from, address to, uint256) internal override {
+        if (from != address(0)) _settleDeit(from);
+        if (to != address(0)) _settleDeit(to);
+    }
+
+    function _afterTokenTransfer(address from, address to, uint256) internal override {
+        uint256 acc = accDeitPerShare;
+        if (from != address(0) && from != DEIT_DEAD) deitDebt[from] = (balanceOf(from) * acc) / DEIT_ACC;
+        if (to != address(0) && to != DEIT_DEAD) deitDebt[to] = (balanceOf(to) * acc) / DEIT_ACC;
     }
 
     function _transfer(address, address, uint256) internal pure override {

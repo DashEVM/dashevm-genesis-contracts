@@ -15,7 +15,9 @@ contract SystemReward is System, IParamSubscriber, ISystemReward {
         if (!alreadyInit) {
             operators[LIGHT_CLIENT_ADDR] = true;
             operators[INCENTIVIZE_ADDR] = true;
-            numOperator = 2;
+            operators[VALIDATOR_CONTRACT_ADDR] = true;
+            operators[SLASH_CONTRACT_ADDR] = true;
+            numOperator = 4;
             alreadyInit = true;
         }
         _;
@@ -60,7 +62,9 @@ contract SystemReward is System, IParamSubscriber, ISystemReward {
         return operators[addr];
     }
 
-    function updateParam(string calldata key, bytes calldata value) external override onlyGov {
+    // doInit: the operator set is lazily created by the first claimRewards; a
+    // deleteOperator before that would be silently undone by that init.
+    function updateParam(string calldata key, bytes calldata value) external override onlyGov doInit {
         if (Memory.compareStrings(key, "addOperator")) {
             bytes memory valueLocal = value;
             require(valueLocal.length == 20, "length of value for addOperator should be 20");
@@ -77,6 +81,12 @@ contract SystemReward is System, IParamSubscriber, ISystemReward {
             assembly {
                 operatorAddr := mload(add(valueLocal, 20))
             }
+            // DashEVM: distributeFinalityReward (system tx) claims from here;
+            // removing the system callers would make it revert and halt the chain.
+            require(
+                operatorAddr != VALIDATOR_CONTRACT_ADDR && operatorAddr != SLASH_CONTRACT_ADDR,
+                "system contracts are permanent operators"
+            );
             delete operators[operatorAddr];
             emit deleteOperator(operatorAddr);
         } else {

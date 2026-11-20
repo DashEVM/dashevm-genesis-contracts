@@ -14,6 +14,12 @@ import "./interface/0.6.x/ISystemReward.sol";
 import "./interface/0.6.x/IStakeHub.sol";
 import "./lib/0.6.x/RLPEncode.sol";
 
+// DashEVM / CardanoEVM: the validator set views the conflicting seal evidence
+// depth needs (BSCValidatorSet implements both).
+interface IValidatorSetDepthView {
+    function getTurnLength() external view returns (uint256);
+}
+
 contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplication {
     using RLPEncode for *;
 
@@ -43,10 +49,39 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
 
     uint256 public felonySlashScope;
 
+    // DashEVM / CardanoEVM conflicting seal evidence (ICP-SPEC section 3,
+    // "Repeat holds"; ICP review 4 N-M3). Precompile 0x0f02 exists only
+    // from ParliaConfig.SealEvidenceBlock on; before that the call returns
+    // nothing and every submission reverts.
+    address public constant SEAL_EVIDENCE_PRECOMPILE = 0x0000000000000000000000000000000000000f02;
+    // EIP-2935 history contract (block hashes of the last 8191 blocks).
+    address public constant HISTORY_STORAGE_ADDR = 0x0000F90827F1C53a10cb7A02335B175320002935;
+    // The conflict depth is a time (chain-guard review H-1): B must be
+    // at least this many seconds of canonical chain below A. Canonical blocks
+    // are at least BLOCK_INTERVAL apart (Parlia, 3 s on these chains), so
+    // ceil(seconds / BLOCK_INTERVAL) blocks of depth are at least that long.
+    uint256 public constant BLOCK_INTERVAL = 3;
+    uint256 public constant INIT_SEAL_CONFLICT_SECONDS = 1 hours;
+    uint256 public constant MIN_SEAL_CONFLICT_SECONDS = 10 minutes;
+    // A must lie in the EIP-2935 history (8191 blocks, about 6.8 hours at
+    // 3 s) when the evidence lands, so the depth stays well inside it.
+    uint256 public constant MAX_SEAL_CONFLICT_SECONDS = 5 hours;
+    // Upper bound of the consensus set size N (the epoch Extra set, pending
+    // removals included, never exceeds the elected maximum of 50), so the
+    // light client's finality depth 2 * N * turnLength is never undercut.
+    uint256 public constant MAX_CONSENSUS_N = 50;
+    uint256 public sealConflictSeconds; // 0 = INIT_SEAL_CONFLICT_SECONDS
+    // false (default): jail only (StakeHub.conflictingSealJail). Governance
+    // sets it to true (updateParam "conflictingSealFullPenalty") once the
+    // light client counts competing branches only with recent timestamps;
+    // then the double-sign penalty applies (slash, long jail, eviction).
+    bool public conflictingSealFullPenalty;
+
     event validatorSlashed(address indexed validator);
     event indicatorCleaned();
     event paramChange(string key, bytes value);
     event failedFelony(address indexed validator, uint256 slashCount, bytes failReason);
+    event conflictingSealSlashed(address indexed validator, uint256 canonicalNumber, uint256 conflictingNumber);
 
     event maliciousVoteSlashed(bytes32 indexed voteAddrSlice);  // @dev deprecated
     event knownResponse(uint32 code);  // @dev deprecated
@@ -110,6 +145,12 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
      */
     function slash(address validator) external onlyCoinbase onlyInit oncePerBlock onlyZeroGasPrice {
         if (!IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).isCurrentValidator(validator)) {
+            return;
+        }
+        // DashEVM: a consensus key replaced through StakeHub.editConsensusAddress
+        // may not seal any more (the node rejects it), and the new key only seals
+        // after the next breathe block. Those missed slots are not downtime.
+        if (IStakeHub(STAKE_HUB_ADDR).consensusExpiration(validator) != 0) {
             return;
         }
         Indicator memory indicator = indicators[validator];
@@ -277,8 +318,14 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
 
         require(header1.length != 0 && header2.length != 0, "empty header");
 
+        // DashEVM: header seals commit to the real chain id (20261012), which
+        // does not fit the uint16 bscChainID constant.
+        uint256 sealChainId;
+        assembly {
+            sealChainId := chainid()
+        }
         bytes[] memory elements = new bytes[](3);
-        elements[0] = bscChainID.encodeUint();
+        elements[0] = sealChainId.encodeUint();
         elements[1] = header1.encodeBytes();
         elements[2] = header2.encodeBytes();
 
@@ -305,6 +352,99 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
 
         uint256 amount = (address(SYSTEM_REWARD_ADDR).balance * felonySlashRewardRatio) / 100;
         ISystemReward(SYSTEM_REWARD_ADDR).claimRewards(msg.sender, amount);
+    }
+
+    /**
+     * @notice DashEVM / CardanoEVM: slash a validator that sealed a block
+     * conflicting with history it had itself built on (ICP-SPEC section 3).
+     * Anyone may submit (the bridge guardian does). The evidence is two
+     * headers sealed by the same ML-DSA key:
+     * - `canonicalHeader` (A) is on this chain (its hash is the canonical hash
+     *   at its height: blockhash or the EIP-2935 history, so within the last
+     *   8191 blocks);
+     * - `conflictingHeader` (B) is at least `sealConflictDepthNow()` blocks
+     *   lower than A but stamped strictly later than A.
+     * Canonical timestamps increase with height, so B is not the canonical
+     * block at its height: the signer sealed a block conflicting with a hash
+     * that was already that deep in the chain it had sealed on top of. The
+     * precompile checks both seals and the order; this function checks A is
+     * canonical and the depth, then JAILS the signer (StakeHub
+     * conflictingSealJail: no stake slashed, no eviction). Only when
+     * governance has set `conflictingSealFullPenalty` does it apply the
+     * double-sign penalty (slash, long jail, eviction).
+     */
+    function submitConflictingSealEvidence(
+        bytes memory canonicalHeader,
+        bytes memory conflictingHeader
+    ) public onlyInit {
+        if (felonySlashRewardRatio == 0) {
+            felonySlashRewardRatio = INIT_FELONY_SLASH_REWARD_RATIO;
+        }
+        require(canonicalHeader.length != 0 && conflictingHeader.length != 0, "empty header");
+
+        uint256 sealChainId;
+        assembly {
+            sealChainId := chainid()
+        }
+        bytes[] memory elements = new bytes[](3);
+        elements[0] = sealChainId.encodeUint();
+        elements[1] = canonicalHeader.encodeBytes();
+        elements[2] = conflictingHeader.encodeBytes();
+        bytes memory input = elements.encodeList();
+
+        bytes memory output = new bytes(160);
+        address precompile = SEAL_EVIDENCE_PRECOMPILE;
+        bool ok;
+        uint256 size;
+        assembly {
+            ok := staticcall(gas(), precompile, add(input, 0x20), mload(input), add(output, 0x20), 160)
+            size := returndatasize()
+        }
+        require(ok && size == 160, "invalid evidence");
+        (address signer, uint256 canonicalNumber, bytes32 canonicalHash, uint256 conflictingNumber,) =
+            abi.decode(output, (address, uint256, bytes32, uint256, bytes32));
+
+        bytes32 known = _canonicalHash(canonicalNumber);
+        require(known != bytes32(0) && known == canonicalHash, "not canonical");
+        require(conflictingNumber + sealConflictDepthNow() <= canonicalNumber, "conflict not deep enough");
+        require(IStakeHub(STAKE_HUB_ADDR).consensusToOperator(signer) != address(0), "validator not migrated");
+
+        if (conflictingSealFullPenalty) {
+            IStakeHub(STAKE_HUB_ADDR).doubleSignSlash(signer);
+            IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).felony(signer);
+        } else {
+            IStakeHub(STAKE_HUB_ADDR).conflictingSealJail(signer);
+        }
+        emit conflictingSealSlashed(signer, canonicalNumber, conflictingNumber);
+
+        uint256 amount = (address(SYSTEM_REWARD_ADDR).balance * felonySlashRewardRatio) / 100;
+        ISystemReward(SYSTEM_REWARD_ADDR).claimRewards(msg.sender, amount);
+    }
+
+    /**
+     * @notice The depth in blocks the conflicting header must lie below the
+     * canonical one: `sealConflictSeconds` (default 1 hour) of 3 s blocks,
+     * never below the light client's finality depth 2 * N * turnLength with N
+     * at its maximum.
+     */
+    function sealConflictDepthNow() public view returns (uint256) {
+        uint256 secs = sealConflictSeconds == 0 ? INIT_SEAL_CONFLICT_SECONDS : sealConflictSeconds;
+        uint256 depth = (secs + BLOCK_INTERVAL - 1) / BLOCK_INTERVAL;
+        uint256 finality = 2 * MAX_CONSENSUS_N * IValidatorSetDepthView(VALIDATOR_CONTRACT_ADDR).getTurnLength();
+        return finality > depth ? finality : depth;
+    }
+
+    function _canonicalHash(uint256 number) internal view returns (bytes32 h) {
+        if (number >= block.number) {
+            return bytes32(0);
+        }
+        if (block.number - number <= 256) {
+            return blockhash(number);
+        }
+        (bool ok, bytes memory ret) = HISTORY_STORAGE_ADDR.staticcall(abi.encode(number));
+        if (ok && ret.length == 32) {
+            h = abi.decode(ret, (bytes32));
+        }
     }
 
     /**
@@ -370,6 +510,10 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
                 newFelonyThreshold <= 1000 && newFelonyThreshold > misdemeanorThreshold,
                 "the felonyThreshold out of range"
             );
+            // DashEVM: clean() decays by felonyThreshold / DECREASE_RATE per
+            // day; below DECREASE_RATE that is 0, entries never expire and the
+            // breathe-block clean() grows without bound.
+            require(newFelonyThreshold >= DECREASE_RATE, "the felonyThreshold must be at least DECREASE_RATE");
             felonyThreshold = newFelonyThreshold;
         } else if (Memory.compareStrings(key, "felonySlashRewardRatio")) {
             require(value.length == 32, "length of felonySlashRewardRatio mismatch");
@@ -390,6 +534,18 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
                 "the malicious vote slash scope out of range"
             );
             felonySlashScope = newMaliciousVoteSlashScope;
+        } else if (Memory.compareStrings(key, "sealConflictSeconds")) {
+            require(value.length == 32, "length of sealConflictSeconds mismatch");
+            uint256 newSealConflictSeconds = BytesToTypes.bytesToUint256(32, value);
+            require(
+                newSealConflictSeconds >= MIN_SEAL_CONFLICT_SECONDS
+                    && newSealConflictSeconds <= MAX_SEAL_CONFLICT_SECONDS,
+                "the sealConflictSeconds out of range"
+            );
+            sealConflictSeconds = newSealConflictSeconds;
+        } else if (Memory.compareStrings(key, "conflictingSealFullPenalty")) {
+            require(value.length == 32, "length of conflictingSealFullPenalty mismatch");
+            conflictingSealFullPenalty = BytesToTypes.bytesToBool(32, value);
         } else {
             require(false, "unknown param");
         }

@@ -12,6 +12,12 @@ import "./interface/0.8.x/IGovToken.sol";
 import "./interface/0.8.x/IStakeCredit.sol";
 import "./lib/0.8.x/Utils.sol";
 
+interface ISlashIndicatorMisses {
+    function getSlashIndicator(
+        address validator
+    ) external view returns (uint256 height, uint256 count);
+}
+
 contract StakeHub is SystemV2, Initializable, Protectable {
     using Utils for string;
     using Utils for bytes;
@@ -35,6 +41,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
     /*----------------- errors -----------------*/
     // @notice signature: 0x5f28f62b
+    error TooManyValidators();
+    error TooManyPendingRotations();
+    error RotationFrozen();
     error ValidatorExisted();
     // @notice signature: 0x056e8811
     error ValidatorNotExisted();
@@ -92,6 +101,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     error ExceedsMaxNodeIDs();
     // @notice signature: 0x440bc78e
     error DuplicateNodeID();
+    // DashEVM launch permissioning: the caller is not on the governance allowlist.
+    error NotAllowlisted();
+    // A pool would exceed launchStakeCap while permissioned.
+    error LaunchStakeCapExceeded();
 
     /*----------------- storage -----------------*/
     uint8 private _receiveFundStatus;
@@ -150,6 +163,108 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // where each NodeID is stored as a fixed 32-byte value.
     mapping(address => bytes32[]) private validatorNodeIDs;
 
+    // ---- DashEVM staking inflation ----
+    // Annual staking reward paid to every delegator (including the validator's
+    // own self-delegation), in basis points of the staked amount. 1200 = 12%.
+    uint256 public stakingAprBps;
+    // Extra reward paid to the validator itself, in basis points of the staking
+    // reward of its pool. 1000 = the validator earns an extra 10% on top of what
+    // its delegators earn (1.2% of the pool per year at a 12% APR).
+    uint256 public validatorRewardBps;
+    // Inflation is paid up to this timestamp.
+    uint256 public lastInflationTime;
+    // Inflation accrued at the previous rates when a rate is changed by
+    // governance, paid at the next breathe block (rates never apply backwards).
+    uint256 public accruedInflation;
+    // Inflation that was minted but could not be assigned to a pool (rounding,
+    // pool jailed since the snapshot). It is paid out with the next distribution.
+    uint256 public inflationCarry;
+    // Staker and validator parts a pool failed to accept. Retried at every
+    // breathe block and by anyone through retryStakingInflation.
+    mapping(address => uint256) public pendingStakerInflation;
+    mapping(address => uint256) public pendingValidatorInflation;
+    // Recipients and stake weights taken at the previous breathe block. The
+    // next distribution pays by these weights, so stake added just before a
+    // breathe block does not earn the reward of the day before it.
+    address[] internal _inflationOperators;
+    address[] internal _inflationCredits;
+    uint256[] internal _inflationWeights;
+    uint256 public inflationWeightTotal;
+    // Time of each operator's last editConsensusAddress. Until the new key is in
+    // Parlia's validator set the validator cannot seal (the node rejects the old
+    // key at once), so concurrent rotations are bounded to keep the chain live,
+    // and a pool rotated after the inflation snapshot forfeits that distribution.
+    mapping(address => uint256) public consensusRotatedAt;
+    // Timestamp of the block that took the current inflation snapshot.
+    uint256 public inflationSnapshotTime;
+    // The validator-bonus part of accruedInflation, so a later change of
+    // validatorRewardBps does not re-split rewards that were already earned.
+    uint256 public accruedValidatorInflation;
+    // Block of the last breathe block (the elected set changes there and becomes
+    // Parlia's set at the following epoch block).
+    uint256 public lastValidatorSetUpdateBlock;
+    // Block of each operator's last editConsensusAddress.
+    mapping(address => uint256) public consensusRotatedBlock;
+    // Registration cap, raise-only by governance (audit F-01: registrations are
+    // never removed, so a fixed cap could be filled once and lock out every new
+    // validator). 0 means MAX_REGISTERED_VALIDATORS.
+    uint256 public maxRegisteredValidators;
+    // Launch permissioning (DashEVM, design decision 2026-11-19). While on, only
+    // allowlisted addresses may create a validator or add stake (delegate,
+    // redelegate), so nobody outside the launch set can buy validator ranking
+    // or governance votes while the self-stake minimum is tiny. Undelegate and
+    // claim stay open to everyone. Both are changed only by governance
+    // (updateParam keys "permissioned", "allowlistAdd", "allowlistRemove");
+    // the genesis values are written by make_genesis.py into initialize().
+    bool public permissioned;
+    mapping(address => bool) public allowlisted;
+    // While permissioned, no validator pool (self-stake plus lock) may exceed
+    // this, so voting weight stays about equal across the launch set (see
+    // review H-1). 0 means no cap. Governance key "launchStakeCap".
+    uint256 public launchStakeCap;
+
+    /*----------------- DashEVM constants -----------------*/
+    uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
+    uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
+    // Bounds the breathe block system txs: at 50 the worst case (validator update
+    // growing the set + inflation with retries for every pool) is ~23.3M gas of
+    // the 35M reserved on a 40M gas block; at 100 it is ~47M, over the block gas
+    // limit, so no breathe block could be built (FinalLayerInflation.t.sol).
+    uint256 public constant MAX_INFLATION_VALIDATORS = 50;
+    // Bounds the daily election read, which scans every registered validator.
+    uint256 public constant MAX_REGISTERED_VALIDATORS = 500; // default cap
+    uint256 public constant MAX_REGISTRATION_CAP = 2000; // governance ceiling (election reads ~95k gas per validator)
+    uint256 public constant MIN_SELF_DELEGATION_FLOOR = 100_000 ether;
+    // Governance lower bounds of the delegation and slash params (BSC's values;
+    // make_genesis.py lowers them per chain with the minimum self-stake).
+    uint256 public constant MIN_DELEGATION_CHANGE_FLOOR = 0.1 ether;
+    uint256 public constant DOWNTIME_SLASH_FLOOR = 1 ether;
+    uint256 public constant FELONY_SLASH_FLOOR = 10 ether;
+    // Launch permissioning at genesis (make_genesis.py sets it per chain).
+    bool private constant PERMISSIONED_AT_GENESIS = false;
+    uint256 private constant LAUNCH_STAKE_CAP_AT_GENESIS = 0;
+    // After a breathe block the contract's elected set and Parlia's set differ
+    // until Parlia applies header E + minerHistoryCheckLen of the next epoch block
+    // E whose header carries the new set. A breathe block that is itself an epoch
+    // block is not in its own header (it is read from the parent state), so in the
+    // worst case E = breathe + 1000, and checkLen = (n/2 + 1) * turnLength - 1 with
+    // n <= MAX_INFLATION_VALIDATORS cabinets and turnLength <= 64 (the governance
+    // bounds of BSCValidatorSet). Rotations are frozen for that window so the
+    // liveness check sees Parlia's set.
+    uint256 public constant ROTATION_FREEZE_BLOCKS = 1000 + (MAX_INFLATION_VALIDATORS / 2 + 1) * 64;
+    // A current validator that missed its turn within this many blocks counts
+    // as offline for the rotation liveness check (SlashIndicator records the
+    // block of every missed turn).
+    // 2 * the largest validator set (MAX_INFLATION_VALIDATORS) * the largest
+    // governance turn length (64): an offline validator misses at least one
+    // turn in every such window, also across a set switch that reorders turns.
+    uint256 public constant RECENT_MISS_BLOCKS = 2 * MAX_INFLATION_VALIDATORS * 64;
+    address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
+    uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
+    uint256 private constant PQ_PUBKEY_LENGTH = 2592;
+    uint256 private constant PQ_PROOF_LENGTH = 1 + 2592 + 4627;
+    uint256 private constant INFLATION_YEAR = 365 days;
+
     /*----------------- structs and events -----------------*/
     struct StakeMigrationPackage {
         address operatorAddress; // the operator address of the target validator to delegate to
@@ -198,7 +313,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     enum SlashType {
         DoubleSign,
         DownTime,
-        MaliciousVote
+        MaliciousVote,
+        ConflictingSeal // DashEVM / CardanoEVM: jail only, see conflictingSealJail
     }
 
     event ValidatorCreated(
@@ -232,6 +348,12 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     event ValidatorUnjailed(address indexed operatorAddress);
     event Claimed(address indexed operatorAddress, address indexed delegator, uint256 bnbAmount);
     event AgentChanged(address indexed operatorAddress, address indexed oldAgent, address indexed newAgent);
+    event StakingInflationDistributed(uint256 amount, uint256 elapsed);
+    event StakingInflationFailed(address indexed operatorAddress, uint256 amount);
+    event StakingInflationRetried(address indexed operatorAddress, uint256 amount);
+    event StakingInflationForfeited(uint256 amount);
+    event PermissionedChanged(bool permissioned);
+    event AllowlistChanged(address indexed account, bool allowed);
 
     // Events for adding and removing NodeIDs.
     event NodeIDAdded(address indexed validator, bytes32 nodeID);
@@ -251,6 +373,22 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         _;
     }
 
+    // notInBlackList checks only the raw caller. Agent and consensus routes act
+    // for an operator, so the operator they resolve to is checked too (see
+    // R3-GOV-01): blacklisting an operator also freezes its delegated admin.
+    modifier operatorNotInBlackList(
+        address operatorAddress
+    ) {
+        if (blackList[operatorAddress]) revert InBlackList();
+        _;
+    }
+
+    // Launch permissioning: while on, only allowlisted callers add stake.
+    modifier onlyAllowlistedWhilePermissioned() {
+        if (permissioned && !allowlisted[msg.sender]) revert NotAllowlisted();
+        _;
+    }
+
     modifier enableReceivingFund() {
         _receiveFundStatus = _ENABLE;
         _;
@@ -267,9 +405,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function initialize() external initializer onlyCoinbase onlyZeroGasPrice {
         transferGasLimit = 5000;
-        minSelfDelegationBNB = 2_000 ether;
+        minSelfDelegationBNB = 100_000 ether;
         minDelegationBNBChange = 1 ether;
-        maxElectedValidators = 45;
+        maxElectedValidators = 21;
         unbondPeriod = 7 days;
         redelegateFeeRate = 2;
         downtimeSlashAmount = 10 ether;
@@ -277,8 +415,49 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         downtimeJailTime = 2 days;
         felonyJailTime = 30 days;
         maxFelonyBetweenBreatheBlock = 2;
+        // DashEVM / CardanoEVM: no native staking inflation, so no APR (chain
+        // review 2, N-5: a carried-over 12% would be shown by wallets and pay nothing).
+        stakingAprBps = 0;
+        validatorRewardBps = 0;
+        lastInflationTime = block.timestamp;
         // Different address will be set depending on the environment
-        __Protectable_init_unchained(0x08E68Ec70FA3b629784fDB28887e206ce8561E08);
+        __Protectable_init_unchained(0x000000000000000000000000000000000000dEaD);
+        _setPermissioned(PERMISSIONED_AT_GENESIS);
+        launchStakeCap = LAUNCH_STAKE_CAP_AT_GENESIS;
+        _initAllowlist();
+    }
+
+    /**
+     * @dev The genesis allowlist (launch validator operators). make_genesis.py
+     * writes one _setAllowlisted line per address below the marker.
+     */
+    function _initAllowlist() internal {
+        // GENESIS_ALLOWLIST
+    }
+
+    function _setPermissioned(
+        bool on
+    ) internal {
+        permissioned = on;
+        emit PermissionedChanged(on);
+    }
+
+    /**
+     * @dev While permissioned, a pool may only grow up to launchStakeCap.
+     */
+    function _checkLaunchCap(
+        address creditContract
+    ) internal view {
+        uint256 cap = launchStakeCap;
+        if (permissioned && cap != 0 && IStakeCredit(creditContract).totalPooledBNB() > cap) {
+            revert LaunchStakeCapExceeded();
+        }
+    }
+
+    function _setAllowlisted(address account, bool allowed) internal {
+        if (account == address(0)) revert InvalidRequest();
+        allowlisted[account] = allowed;
+        emit AllowlistChanged(account, allowed);
     }
 
     /*----------------- Implement cross chain app -----------------*/
@@ -337,11 +516,12 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         bytes calldata blsProof,
         Commission calldata commission,
         Description calldata description
-    ) external payable whenNotPaused notInBlackList {
+    ) external payable whenNotPaused notInBlackList onlyAllowlistedWhilePermissioned {
         // basic check
         address operatorAddress = msg.sender;
         if (_validatorSet.contains(operatorAddress)) revert ValidatorExisted();
         if (agentToOperator[operatorAddress] != address(0)) revert InvalidValidator();
+        if (_validatorSet.length() >= _registrationCap()) revert TooManyValidators();
 
         if (consensusToOperator[consensusAddress] != address(0)) {
             revert DuplicateConsensusAddress();
@@ -361,11 +541,14 @@ contract StakeHub is SystemV2, Initializable, Protectable {
                 || commission.maxChangeRate > commission.maxRate
         ) revert InvalidCommission();
         if (!_checkMoniker(description.moniker)) revert InvalidMoniker();
-        // proof-of-possession verify
-        if (!_checkVoteAddress(operatorAddress, voteAddress, blsProof)) revert InvalidVoteAddress();
+        // the vote address is only an identifier derived from the consensus address
+        if (!_checkVoteAddress(consensusAddress, voteAddress)) revert InvalidVoteAddress();
+        // ML-DSA proof of possession of the consensus key (blsProof carries it)
+        if (!_checkConsensusProof(consensusAddress, operatorAddress, blsProof)) revert InvalidConsensusAddress();
 
         // deploy stake credit proxy contract
         address creditContract = _deployStakeCredit(operatorAddress, description.moniker);
+        _checkLaunchCap(creditContract);
 
         _validatorSet.add(operatorAddress);
         _monikerSet[monikerHash] = true;
@@ -390,25 +573,107 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
     /**
      * @param newConsensusAddress the new consensus address of the validator
+     * @param consensusProof ML-DSA proof of possession of the new consensus key
      */
     function editConsensusAddress(
-        address newConsensusAddress
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+        address newConsensusAddress,
+        bytes calldata consensusProof
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         if (newConsensusAddress == address(0)) revert InvalidConsensusAddress();
         if (consensusToOperator[newConsensusAddress] != address(0)) {
             revert DuplicateConsensusAddress();
         }
 
         address operatorAddress = _bep410MsgSender();
+        if (!_checkConsensusProof(newConsensusAddress, operatorAddress, consensusProof)) {
+            revert InvalidConsensusAddress();
+        }
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
+        _checkRotationLiveness(operatorAddress);
 
+        consensusRotatedAt[operatorAddress] = block.timestamp;
+        consensusRotatedBlock[operatorAddress] = block.number;
         consensusExpiration[valInfo.consensusAddress] = block.timestamp;
         valInfo.consensusAddress = newConsensusAddress;
         valInfo.updateTime = block.timestamp;
         consensusToOperator[newConsensusAddress] = operatorAddress;
 
+        // The vote identifier is derived from the consensus address; keep them in step.
+        bytes memory newVoteAddress = bytes.concat(bytes4("FLPQ"), bytes24(0), bytes20(newConsensusAddress));
+        voteExpiration[valInfo.voteAddress] = block.timestamp;
+        valInfo.voteAddress = newVoteAddress;
+        voteToOperator[newVoteAddress] = operatorAddress;
+        emit VoteAddressEdited(operatorAddress, newVoteAddress);
+
         emit ConsensusAddressEdited(operatorAddress, newConsensusAddress);
+    }
+
+    /**
+     * @dev The node rejects blocks sealed by a replaced consensus key from the
+     * next block on, while the new key only seals once the next breathe block and
+     * epoch have put it in Parlia's validator set. Parlia needs floor(n/2)+1 of
+     * the n current validators able to seal (recents rule), so a rotation of a
+     * current validator is refused if it would leave fewer than that, counting
+     * the rotations that have not settled yet.
+     */
+    function _checkRotationLiveness(
+        address operatorAddress
+    ) internal view {
+        // Until Parlia has installed the set elected at the last breathe block,
+        // the contract cannot tell which keys Parlia lets seal: no rotations.
+        if (lastValidatorSetUpdateBlock != 0 && block.number <= lastValidatorSetUpdateBlock + ROTATION_FREEZE_BLOCKS) {
+            revert RotationFrozen();
+        }
+        IBSCValidatorSet vs = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        // A validator removed from the working set (downtime, self stake, felony,
+        // forced maintenance exit) stays in Parlia's set while the working set no
+        // longer shows it (review CT-01). The next epoch header carries the working
+        // set without it, and Parlia installs that within the same worst case as
+        // after a breathe block, so rotations wait ROTATION_FREEZE_BLOCKS after
+        // the last removal (a window, not the next breathe block, so repeated
+        // self-evictions cannot hold rotations off for a whole day each).
+        uint256 evictedAt = vs.lastEvictionBlock();
+        if (evictedAt != 0 && block.number <= evictedAt + ROTATION_FREEZE_BLOCKS) {
+            revert RotationFrozen();
+        }
+        address[] memory current = vs.getValidators();
+        // Parlia's quorum is over the set it took at the last epoch block. That
+        // set also holds validators that are in maintenance now and validators
+        // removed by a felony since the last breathe block, and it has at most
+        // numOfCabinets members. Both kinds are counted as members that cannot seal.
+        uint256 maintaining = vs.numOfMaintaining();
+        uint256 felonies = _felonyMap[block.timestamp / BREATHE_BLOCK_INTERVAL];
+        uint256 cabinets = vs.numOfCabinets();
+        if (cabinets == 0) cabinets = 21;
+        uint256 members = current.length + maintaining + felonies;
+        if (members > cabinets) members = cabinets;
+
+        bool isCurrent;
+        uint256 unavailable = maintaining + felonies;
+        for (uint256 i; i < current.length; ++i) {
+            address op = consensusToOperator[current[i]];
+            if (op != address(0) && op == operatorAddress) {
+                isCurrent = true;
+                continue;
+            }
+            // a rotation whose new key Parlia has not installed yet: a breathe block
+            // after the rotation and then its epoch (outside the freeze) must have
+            // passed, measured in blocks, not time
+            if (op != address(0)) {
+                uint256 rotatedBlock = consensusRotatedBlock[op];
+                if (rotatedBlock != 0 && rotatedBlock >= lastValidatorSetUpdateBlock) {
+                    ++unavailable;
+                    continue;
+                }
+            }
+            // a validator that missed a turn recently is probably offline
+            (uint256 missedAt,) = ISlashIndicatorMisses(SLASH_CONTRACT_ADDR).getSlashIndicator(current[i]);
+            if (missedAt != 0 && missedAt + RECENT_MISS_BLOCKS >= block.number) ++unavailable;
+        }
+        if (!isCurrent) return;
+        // after the rotation members - unavailable - 1 can seal; Parlia needs members/2 + 1
+        if (members < unavailable + 1 + members / 2 + 1) revert TooManyPendingRotations();
     }
 
     /**
@@ -416,7 +681,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function editCommissionRate(
         uint64 commissionRate
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         address operatorAddress = _bep410MsgSender();
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
@@ -439,7 +704,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function editDescription(
         Description memory description
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         address operatorAddress = _bep410MsgSender();
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
@@ -458,23 +723,11 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function editVoteAddress(
         bytes calldata newVoteAddress,
         bytes calldata blsProof
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
-        // proof-of-possession verify
-        address operatorAddress = _bep410MsgSender();
-        if (!_checkVoteAddress(operatorAddress, newVoteAddress, blsProof)) revert InvalidVoteAddress();
-        if (voteToOperator[newVoteAddress] != address(0)) {
-            revert DuplicateVoteAddress();
-        }
-
-        Validator storage valInfo = _validators[operatorAddress];
-        if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
-
-        voteExpiration[valInfo.voteAddress] = block.timestamp;
-        valInfo.voteAddress = newVoteAddress;
-        valInfo.updateTime = block.timestamp;
-        voteToOperator[newVoteAddress] = operatorAddress;
-
-        emit VoteAddressEdited(operatorAddress, newVoteAddress);
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
+        // DashEVM has no BLS vote keys; the identifier is fixed at creation.
+        newVoteAddress;
+        blsProof;
+        revert InvalidVoteAddress();
     }
 
     /**
@@ -482,7 +735,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function unjail(
         address operatorAddress
-    ) external whenNotPaused notInBlackList validatorExist(operatorAddress) {
+    ) external whenNotPaused notInBlackList validatorExist(operatorAddress) operatorNotInBlackList(operatorAddress) {
         Validator storage valInfo = _validators[operatorAddress];
         if (!valInfo.jailed) revert ValidatorNotJailed();
 
@@ -503,15 +756,19 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function delegate(
         address operatorAddress,
         bool delegateVotePower
-    ) external payable whenNotPaused notInBlackList validatorExist(operatorAddress) {
+    ) external payable whenNotPaused notInBlackList onlyAllowlistedWhilePermissioned validatorExist(operatorAddress) {
         uint256 bnbAmount = msg.value;
         if (bnbAmount < minDelegationBNBChange) revert DelegationAmountTooSmall();
 
         address delegator = msg.sender;
         Validator memory valInfo = _validators[operatorAddress];
         if (valInfo.jailed && delegator != operatorAddress) revert OnlySelfDelegation();
+        // While permissioned, stake is only an operator's own self-delegation
+        // (review H-1: one key could otherwise stack votes on any pool).
+        if (permissioned && delegator != operatorAddress) revert OnlySelfDelegation();
 
         uint256 shares = IStakeCredit(valInfo.creditContract).delegate{ value: bnbAmount }(delegator);
+        _checkLaunchCap(valInfo.creditContract);
         emit Delegated(operatorAddress, delegator, shares, bnbAmount);
 
         IGovToken(GOV_TOKEN_ADDR).sync(valInfo.creditContract, delegator);
@@ -559,6 +816,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         external
         whenNotPaused
         notInBlackList
+        onlyAllowlistedWhilePermissioned
         validatorExist(srcValidator)
         validatorExist(dstValidator)
         enableReceivingFund
@@ -570,6 +828,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         Validator memory srcValInfo = _validators[srcValidator];
         Validator memory dstValInfo = _validators[dstValidator];
         if (dstValInfo.jailed && delegator != dstValidator) revert OnlySelfDelegation();
+        if (permissioned && delegator != dstValidator) revert OnlySelfDelegation();
 
         uint256 bnbAmount = IStakeCredit(srcValInfo.creditContract).unbond(delegator, shares);
         if (bnbAmount < minDelegationBNBChange) revert DelegationAmountTooSmall();
@@ -587,6 +846,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
         bnbAmount -= feeCharge;
         uint256 newShares = IStakeCredit(dstValInfo.creditContract).delegate{ value: bnbAmount }(delegator);
+        _checkLaunchCap(dstValInfo.creditContract);
         emit Redelegated(srcValidator, dstValidator, delegator, shares, newShares, bnbAmount);
 
         address[] memory stakeCredits = new address[](2);
@@ -631,6 +891,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         address[] calldata operatorAddresses,
         address account
     ) external whenNotPaused notInBlackList {
+        // The dead-address lock shares carry no governance weight: minting govBNB
+        // for them would only inflate the supply that quorum is measured against.
+        if (account == DEAD_ADDRESS) revert InvalidRequest();
         uint256 _length = operatorAddresses.length;
         address[] memory stakeCredits = new address[](_length);
         address credit;
@@ -665,6 +928,203 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     }
 
     /**
+     * @notice Unused on DashEVM (the engine never mints). Inflation amount at the breathe block
+     * whose timestamp is `timestamp`, given the current state:
+     * accruedInflation + snapshotStake * apr * (1 + validatorReward) * elapsed / 1 year.
+     * snapshotStake is the stake of the working (elected, not jailed) validators
+     * taken at the previous breathe block, so it depends only on state written
+     * by the previous distribution and by governance, never on transactions of
+     * the breathe block itself. The whole unpaid time is included, also after
+     * a long halt, and paid to the snapshot the stake earned it under.
+     */
+    function pendingStakingInflation(
+        uint256 timestamp
+    ) public view returns (uint256 total) {
+        total = accruedInflation;
+        if (lastInflationTime == 0 || timestamp <= lastInflationTime) return total;
+        total += _inflationFor(timestamp - lastInflationTime);
+    }
+
+    function _inflationFor(
+        uint256 elapsed
+    ) internal view returns (uint256) {
+        return (inflationWeightTotal * stakingAprBps * (10_000 + validatorRewardBps) * elapsed)
+            / (100_000_000 * INFLATION_YEAR);
+    }
+
+    /**
+     * @dev Books the inflation earned so far at the current rates before a rate
+     * changes, so a new rate only applies from now on.
+     */
+    function _checkpointInflation() internal {
+        if (lastInflationTime == 0 || block.timestamp <= lastInflationTime) return;
+        // All unpaid time is booked at the rates in force while it passed,
+        // including the backlog of a long halt.
+        uint256 elapsed = block.timestamp - lastInflationTime;
+        uint256 amount = (inflationWeightTotal * stakingAprBps * (10_000 + validatorRewardBps) * elapsed)
+            / (100_000_000 * INFLATION_YEAR);
+        accruedInflation += amount;
+        accruedValidatorInflation += (amount * validatorRewardBps) / (10_000 + validatorRewardBps);
+        lastInflationTime = block.timestamp;
+    }
+
+    /**
+     * @dev DashEVM / CardanoEVM: there is no native staking inflation (the native
+     * coin is bridged DASH / ADA and is never minted; staking rewards are fees and,
+     * once DEIT launches, DEIT, both paid outside this contract), so BSC's distributeStakingInflation is
+     * removed. Its other job, recording the block of each validator set update
+     * for the consensus-key rotation guard, moves here: BSCValidatorSet calls it
+     * from updateValidatorSetV2 (chain review H-2).
+     */
+    function noteValidatorSetUpdate() external onlyValidatorContract {
+        lastValidatorSetUpdateBlock = block.number;
+    }
+
+    /**
+     * @dev Whether a pool of the inflation snapshot earns at this distribution:
+     * not jailed, and its consensus key not rotated since the snapshot (it could
+     * not seal until the new key was installed, and is exempt from downtime
+     * slashing for that time).
+     */
+    function _earnsInflation(
+        address operatorAddress
+    ) internal view returns (bool) {
+        if (_validators[operatorAddress].jailed) return false;
+        uint256 rotatedAt = consensusRotatedAt[operatorAddress];
+        return rotatedAt == 0 || rotatedAt < inflationSnapshotTime;
+    }
+
+    /**
+     * @notice Pays out staking inflation a pool failed to accept earlier.
+     * Anyone can call it.
+     */
+    function retryStakingInflation(
+        address operatorAddress
+    ) external {
+        _retryPending(operatorAddress);
+    }
+
+    function _retryPending(
+        address operatorAddress
+    ) internal {
+        uint256 stakerPart = pendingStakerInflation[operatorAddress];
+        uint256 validatorPart = pendingValidatorInflation[operatorAddress];
+        if (stakerPart == 0 && validatorPart == 0) return;
+        Validator storage valInfo = _validators[operatorAddress];
+        if (valInfo.jailed || valInfo.creditContract == address(0)) return;
+        pendingStakerInflation[operatorAddress] = 0;
+        pendingValidatorInflation[operatorAddress] = 0;
+        emit StakingInflationRetried(operatorAddress, stakerPart + validatorPart);
+        _payInflation(operatorAddress, valInfo.creditContract, stakerPart, validatorPart);
+    }
+
+    function _payInflation(
+        address operatorAddress,
+        address credit,
+        uint256 stakerPart,
+        uint256 validatorPart
+    ) internal {
+        if (stakerPart > 0) {
+            try IStakeCredit(credit).distributeReward{ value: stakerPart }(0) { }
+            catch {
+                pendingStakerInflation[operatorAddress] += stakerPart;
+                emit StakingInflationFailed(operatorAddress, stakerPart);
+            }
+        }
+        if (validatorPart > 0) {
+            try IStakeCredit(credit).distributeReward{ value: validatorPart }(10_000) { }
+            catch {
+                pendingValidatorInflation[operatorAddress] += validatorPart;
+                emit StakingInflationFailed(operatorAddress, validatorPart);
+            }
+        }
+        try IGovToken(GOV_TOKEN_ADDR).sync(credit, operatorAddress) { } catch { }
+    }
+
+    /**
+     * @dev Records the current working validators and their stake as the weights
+     * of the next distribution. A pool whose stake cannot be read gets weight 0.
+     */
+    function _snapshotInflationRecipients() internal {
+        delete _inflationOperators;
+        delete _inflationCredits;
+        delete _inflationWeights;
+        uint256 total;
+        (address[] memory credits, address[] memory operators, uint256 n) = _inflationRecipients();
+        for (uint256 i; i < n; ++i) {
+            uint256 weight;
+            try IStakeCredit(credits[i]).totalPooledBNB() returns (uint256 pooled) {
+                weight = pooled;
+            } catch { }
+            if (weight == 0) continue;
+            _inflationOperators.push(operators[i]);
+            _inflationCredits.push(credits[i]);
+            _inflationWeights.push(weight);
+            total += weight;
+        }
+        inflationWeightTotal = total;
+        inflationSnapshotTime = block.timestamp;
+    }
+
+    /**
+     * @notice Whether the validator with this consensus address is jailed (a
+     * single storage read; BSCValidatorSet checks every elected validator).
+     */
+    function isConsensusJailed(
+        address consensusAddress
+    ) external view returns (bool) {
+        address operatorAddress = consensusToOperator[consensusAddress];
+        return operatorAddress != address(0) && _validators[operatorAddress].jailed;
+    }
+
+    /**
+     * @notice The recipients and stake weights the next distribution pays by.
+     */
+    function getInflationSnapshot()
+        external
+        view
+        returns (address[] memory operators, uint256[] memory weights, uint256 total)
+    {
+        return (_inflationOperators, _inflationWeights, inflationWeightTotal);
+    }
+
+    /**
+     * @dev Validators that earn staking inflation: the working validators of the
+     * current (elected) validator set that are registered here and not jailed.
+     * Registering a validator is permissionless, so iterating every registered
+     * validator would let anyone push the breathe block over the gas limit.
+     */
+    function _inflationRecipients()
+        internal
+        view
+        returns (address[] memory credits, address[] memory operators, uint256 n)
+    {
+        address[] memory consensusAddrs = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).getValidators();
+        uint256 length = consensusAddrs.length;
+        if (length > MAX_INFLATION_VALIDATORS) length = MAX_INFLATION_VALIDATORS;
+        credits = new address[](length);
+        operators = new address[](length);
+        for (uint256 i; i < length; ++i) {
+            address operatorAddress = consensusToOperator[consensusAddrs[i]];
+            if (operatorAddress == address(0)) continue;
+            Validator storage valInfo = _validators[operatorAddress];
+            address credit = valInfo.creditContract;
+            if (valInfo.jailed || credit == address(0)) continue;
+            bool seen;
+            for (uint256 j; j < n; ++j) {
+                if (operators[j] == operatorAddress) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            credits[n] = credit;
+            operators[n] = operatorAddress;
+            ++n;
+        }
+    }
+
+    /**
      * @dev Downtime slash. Only the `SlashIndicator` contract can call this function.
      */
     function downtimeSlash(
@@ -682,6 +1142,38 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         emit ValidatorSlashed(operatorAddress, jailUntil, slashAmount, SlashType.DownTime);
 
         IGovToken(GOV_TOKEN_ADDR).sync(valInfo.creditContract, operatorAddress);
+    }
+
+    /**
+     * @dev DashEVM / CardanoEVM conflicting seal penalty while the ICP light
+     * client lacks its timestamp-recency rule (chain-guard review H-1):
+     * jail only. No stake is slashed and the validator is not evicted from the
+     * current set (it is simply not elected at the next breathe block, and the
+     * chain's churn cap removes jailed validators first). Jailed for
+     * `downtimeJailTime`. Only the `SlashIndicator` contract can call this.
+     */
+    function conflictingSealJail(
+        address consensusAddress
+    ) external onlySlash whenNotPaused {
+        address operatorAddress = consensusToOperator[consensusAddress];
+        if (!_validatorSet.contains(operatorAddress)) revert ValidatorNotExisted(); // should never happen
+        Validator storage valInfo = _validators[operatorAddress];
+
+        uint256 index = block.timestamp / BREATHE_BLOCK_INTERVAL;
+        if (_felonyMap[index] >= maxFelonyBetweenBreatheBlock) revert NoMoreFelonyAllowed();
+        _felonyMap[index] += 1;
+
+        if (
+            consensusExpiration[consensusAddress] != 0
+                && consensusExpiration[consensusAddress] + BREATHE_BLOCK_INTERVAL < block.timestamp
+        ) {
+            revert ConsensusAddressExpired();
+        }
+        if (valInfo.jailed && valInfo.jailUntil > block.timestamp) revert AlreadySlashed();
+
+        uint256 jailUntil = block.timestamp + downtimeJailTime;
+        _jailValidator(valInfo, jailUntil);
+        emit ValidatorSlashed(operatorAddress, jailUntil, 0, SlashType.ConflictingSeal);
     }
 
     /**
@@ -769,21 +1261,36 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         } else if (key.compareStrings("minSelfDelegationBNB")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMinSelfDelegationBNB = value.bytesToUint256(32);
-            if (newMinSelfDelegationBNB < 1000 ether || newMinSelfDelegationBNB > 100_000 ether) {
+            if (newMinSelfDelegationBNB < MIN_SELF_DELEGATION_FLOOR || newMinSelfDelegationBNB > 10_000_000 ether) {
+                revert InvalidValue(key, value);
+            }
+            // a cap below the minimum would stop every top-up: raise the cap first
+            if (permissioned && launchStakeCap != 0 && newMinSelfDelegationBNB + LOCK_AMOUNT > launchStakeCap) {
                 revert InvalidValue(key, value);
             }
             minSelfDelegationBNB = newMinSelfDelegationBNB;
         } else if (key.compareStrings("minDelegationBNBChange")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMinDelegationBNBChange = value.bytesToUint256(32);
-            if (newMinDelegationBNBChange < 0.1 ether || newMinDelegationBNBChange > 10 ether) {
+            if (newMinDelegationBNBChange < MIN_DELEGATION_CHANGE_FLOOR || newMinDelegationBNBChange > 10 ether) {
                 revert InvalidValue(key, value);
             }
             minDelegationBNBChange = newMinDelegationBNBChange;
+        } else if (key.compareStrings("maxRegisteredValidators")) {
+            if (value.length != 32) revert InvalidValue(key, value);
+            uint256 newMaxRegisteredValidators = value.bytesToUint256(32);
+            // raise only; every full-set walk (election info, validator lists) is paginated
+            if (newMaxRegisteredValidators <= _registrationCap() || newMaxRegisteredValidators > MAX_REGISTRATION_CAP) {
+                revert InvalidValue(key, value);
+            }
+            maxRegisteredValidators = newMaxRegisteredValidators;
         } else if (key.compareStrings("maxElectedValidators")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMaxElectedValidators = value.bytesToUint256(32);
-            if (newMaxElectedValidators == 0 || newMaxElectedValidators > 500) revert InvalidValue(key, value);
+            // every elected validator must be able to earn staking inflation
+            if (newMaxElectedValidators == 0 || newMaxElectedValidators > MAX_INFLATION_VALIDATORS) {
+                revert InvalidValue(key, value);
+            }
             maxElectedValidators = newMaxElectedValidators;
         } else if (key.compareStrings("unbondPeriod")) {
             if (value.length != 32) revert InvalidValue(key, value);
@@ -800,14 +1307,14 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         } else if (key.compareStrings("downtimeSlashAmount")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newDowntimeSlashAmount = value.bytesToUint256(32);
-            if (newDowntimeSlashAmount < 1 ether || newDowntimeSlashAmount >= felonySlashAmount) {
+            if (newDowntimeSlashAmount < DOWNTIME_SLASH_FLOOR || newDowntimeSlashAmount >= felonySlashAmount) {
                 revert InvalidValue(key, value);
             }
             downtimeSlashAmount = newDowntimeSlashAmount;
         } else if (key.compareStrings("felonySlashAmount")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newFelonySlashAmount = value.bytesToUint256(32);
-            if (newFelonySlashAmount < 10 ether || newFelonySlashAmount <= downtimeSlashAmount) {
+            if (newFelonySlashAmount < FELONY_SLASH_FLOOR || newFelonySlashAmount <= downtimeSlashAmount) {
                 revert InvalidValue(key, value);
             }
             felonySlashAmount = newFelonySlashAmount;
@@ -831,11 +1338,33 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             address newStakeHubProtector = value.bytesToAddress(20);
             if (newStakeHubProtector == address(0)) revert InvalidValue(key, value);
             _setProtector(newStakeHubProtector);
+        } else if (key.compareStrings("stakingAprBps")) {
+            // DashEVM / CardanoEVM: the native coin is never minted.
+            revert InvalidValue(key, value);
+        } else if (key.compareStrings("validatorRewardBps")) {
+            revert InvalidValue(key, value);
         } else if (key.compareStrings("maxNodeIDs")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMaxNodeIDs = value.bytesToUint256(32);
             if (newMaxNodeIDs == 0) revert InvalidValue(key, value);
             maxNodeIDs = newMaxNodeIDs;
+        } else if (key.compareStrings("launchStakeCap")) {
+            // 0 (no cap) or room for at least the minimum self-stake plus the lock
+            if (value.length != 32) revert InvalidValue(key, value);
+            uint256 newCap = value.bytesToUint256(32);
+            if (newCap != 0 && newCap < minSelfDelegationBNB + LOCK_AMOUNT) revert InvalidValue(key, value);
+            launchStakeCap = newCap;
+        } else if (key.compareStrings("permissioned")) {
+            // 1 = only allowlisted addresses register and stake, 0 = open to all
+            if (value.length != 32) revert InvalidValue(key, value);
+            uint256 on = value.bytesToUint256(32);
+            if (on > 1) revert InvalidValue(key, value);
+            _setPermissioned(on == 1);
+        } else if (key.compareStrings("allowlistAdd") || key.compareStrings("allowlistRemove")) {
+            if (value.length != 20) revert InvalidValue(key, value);
+            address account = value.bytesToAddress(20);
+            if (account == address(0)) revert InvalidValue(key, value);
+            _setAllowlisted(account, key.compareStrings("allowlistAdd"));
         } else {
             revert UnknownParam(key, value);
         }
@@ -1038,7 +1567,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             address operatorAddress = _validatorSet.at(offset + i);
             Validator memory valInfo = _validators[operatorAddress];
             consensusAddrs[i] = valInfo.consensusAddress;
-            votingPowers[i] = valInfo.jailed ? 0 : IStakeCredit(valInfo.creditContract).totalPooledBNB();
+            votingPowers[i] = _electionPower(operatorAddress, valInfo);
             voteAddrs[i] = valInfo.voteAddress;
         }
     }
@@ -1049,7 +1578,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function addNodeIDs(
         bytes32[] calldata nodeIDs
-    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) operatorNotInBlackList(_bep563MsgSender()) {
         maxNodeIDsInitializer();
 
         if (nodeIDs.length == 0) {
@@ -1098,7 +1627,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function removeNodeIDs(
         bytes32[] calldata targetNodeIDs
-    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) operatorNotInBlackList(_bep563MsgSender()) {
         address validator = _bep563MsgSender();
         bytes32[] storage nodeIDs = validatorNodeIDs[validator];
         uint256 length = nodeIDs.length;
@@ -1157,6 +1686,32 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     }
 
     /*----------------- internal functions -----------------*/
+    /**
+     * @dev Election weight: 0 (not elected) when jailed, when the operator is not
+     * allowlisted while permissioned (so a governance removal takes effect at the
+     * next breathe block), or when its own self-stake is below the current
+     * minimum (so raising the minimum takes effect without an undelegate).
+     * review M-1 / L-1. With every weight 0 the engine keeps the current
+     * set (feynmanfork.go), so this cannot halt the chain.
+     */
+    function _electionPower(address operatorAddress, Validator memory valInfo) internal view returns (uint256) {
+        if (valInfo.jailed) return 0;
+        if (permissioned && !allowlisted[operatorAddress]) return 0;
+        if (IStakeCredit(valInfo.creditContract).getPooledBNB(operatorAddress) < minSelfDelegationBNB) return 0;
+        uint256 pooled = IStakeCredit(valInfo.creditContract).totalPooledBNB();
+        // While capped, block-fee rewards grow a pool past launchStakeCap without
+        // a deposit; the elected power (which FeeCurrencyDirectory's 2/3
+        // validator actions weigh) is capped like the votes (review).
+        uint256 cap = launchStakeCap;
+        if (permissioned && cap != 0 && pooled > cap) pooled = cap;
+        return pooled;
+    }
+
+    function _registrationCap() internal view returns (uint256) {
+        uint256 cap = maxRegisteredValidators;
+        return cap == 0 ? MAX_REGISTERED_VALIDATORS : cap;
+    }
+
     function _checkMoniker(
         string memory moniker
     ) internal pure returns (bool) {
@@ -1188,35 +1743,37 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         return true;
     }
 
-    function _checkVoteAddress(
+    /**
+     * @dev DashEVM has no BLS fast finality. The vote address is kept only as
+     * a 48 byte validator identifier: "FLPQ" || 24 zero bytes || consensus
+     * address. Binding it to the consensus address (which needs a proof of
+     * possession) stops anyone from front-running another validator's identifier.
+     */
+    function _checkVoteAddress(address consensusAddress, bytes calldata voteAddress) internal pure returns (bool) {
+        return keccak256(voteAddress) == keccak256(bytes.concat(bytes4("FLPQ"), bytes24(0), bytes20(consensusAddress)));
+    }
+
+    /**
+     * @dev ML-DSA-87 proof of possession of a consensus key.
+     * proof = scheme(1) || publicKey(2592) || signature(4627). The key must derive
+     * consensusAddress (last 20 bytes of keccak256(scheme || publicKey)) and the
+     * signature must verify in the FinalLayer/contract/v1 domain (precompile
+     * 0x0f01) over keccak256("FinalLayer/validator-pop/v1" || chainid ||
+     * consensusAddress || operatorAddress).
+     */
+    function _checkConsensusProof(
+        address consensusAddress,
         address operatorAddress,
-        bytes calldata voteAddress,
-        bytes calldata blsProof
+        bytes calldata proof
     ) internal view returns (bool) {
-        if (voteAddress.length != BLS_PUBKEY_LENGTH || blsProof.length != BLS_SIG_LENGTH) {
-            return false;
-        }
-
-        // get msg hash
-        bytes32 msgHash = keccak256(abi.encodePacked(operatorAddress, voteAddress, block.chainid));
-        bytes memory msgBz = new bytes(32);
-        assembly {
-            mstore(add(msgBz, 32), msgHash)
-        }
-
-        // call the precompiled contract to verify the BLS signature
-        // the precompiled contract's address is 0x66
-        bytes memory input = bytes.concat(msgBz, blsProof, voteAddress); // length: 32 + 96 + 48 = 176
-        bytes memory output = new bytes(1);
-        assembly {
-            let len := mload(input)
-            if iszero(staticcall(not(0), 0x66, add(input, 0x20), len, add(output, 0x20), 0x01)) { revert(0, 0) }
-        }
-        uint8 result = uint8(output[0]);
-        if (result != uint8(1)) {
-            return false;
-        }
-        return true;
+        if (proof.length != PQ_PROOF_LENGTH || uint8(proof[0]) != PQ_SCHEME_MLDSA87) return false;
+        if (address(uint160(uint256(keccak256(proof[:1 + PQ_PUBKEY_LENGTH])))) != consensusAddress) return false;
+        bytes32 message = keccak256(
+            abi.encodePacked("FinalLayer/validator-pop/v1", block.chainid, consensusAddress, operatorAddress)
+        );
+        (bool ok, bytes memory out) =
+            PQ_VERIFY_PRECOMPILE.staticcall(bytes.concat(proof[:1], message, proof[1:]));
+        return ok && out.length == 32 && abi.decode(out, (uint256)) == 1;
     }
 
     function _deployStakeCredit(address operatorAddress, string memory moniker) internal returns (address) {
